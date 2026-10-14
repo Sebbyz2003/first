@@ -43,8 +43,8 @@ warnings.filterwarnings("ignore")
 # ── CONFIGURATION ────────────────────────────────────────────────────────────
 MP_API_KEY          = os.environ.get("MP_API_KEY", "FJ9RiSfrTX30wN1yppawNgokMc8nuHxo")
 GNOME_MASTER_DIR    = "./extracted_batches"  # Hardcoded to your specific folder
-GRAPH_CACHE_DIR     = "./graph_cache_mp_cgcnn"
-GNOME_CACHE_DIR     = "./graph_cache_gnome_cgcnn"
+GRAPH_CACHE_DIR     = "./graph_cache_mp_cgcnn_pbc"   # _pbc: graphs now carry periodic edges; old caches are incompatible
+GNOME_CACHE_DIR     = "./graph_cache_gnome_cgcnn_pbc"
 
 CUTOFF_RADIUS       = 4.5  
 MAX_UNIT_CELL_ATOMS = 80
@@ -72,6 +72,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 RARE_EARTH_Z = {21, 39} | set(range(57, 72))
 TM_Z         = {22, 23, 24, 25, 26, 27, 28}
 MU0          = 4 * np.pi * 1e-7
+JS_THRESHOLD = math.sqrt(4 * MU0 * MAGNITO_THRESHOLD)   # ≈1.55 T: J_s whose (BH)max ceiling is 60 MGOe
 
 
 # ── PHYSICS & MATH UTILS ─────────────────────────────────────────────────────
@@ -79,6 +80,14 @@ def bhmax_from_moment(m: float) -> float:
     msat = abs(m) * 9.2740100783e6   # μB/Å³ → A/m (μ_B 9.274e-24 A·m² / Å³ 1e-30 m³); was 1e3 (wrong, off ~9274×)            
     bsat = MU0 * msat              
     return bsat ** 2 / (4 * MU0)   
+
+# The network regresses J_s (T, ~0–2.5) rather than (BH)max (J/m³, ~0–1e6): same information, sane scale for
+# Huber/Adam. Cached labels stay in J/m³; these convert at the loss and at reporting time.
+def js_from_bhmax(bh):
+    return torch.sqrt(4 * MU0 * bh.clamp(min=0.0))
+
+def bhmax_from_js(js):
+    return js ** 2 / (4 * MU0)
 
 @contextlib.contextmanager
 def _silence_c_stderr():
@@ -100,12 +109,12 @@ def get_spacegroup_number(struct: Structure) -> int:
     except Exception:
         return 1
 
-def robust_radius_graph(pos, r, batch):
-    dist_mat = torch.cdist(pos, pos, p=2.0)
-    batch_mask = batch.unsqueeze(0) == batch.unsqueeze(1)
-    valid_edges = (dist_mat <= r) & (dist_mat > 1e-5) & batch_mask
-    edge_index = valid_edges.nonzero(as_tuple=False).t().contiguous()
-    return edge_index
+def periodic_radius_graph(struct: Structure, r: float):
+    """Edges to every periodic image within r (CGCNN's crystal graph), not just sites in one cell."""
+    centers, neighbors, _, dists = struct.get_neighbor_list(r=r)
+    edge_index = torch.tensor(np.array([neighbors, centers]), dtype=torch.long).reshape(2, -1)  # [source j, target i]
+    edge_dist = torch.tensor(np.asarray(dists), dtype=torch.float)
+    return edge_index, edge_dist
 
 
 # ── CGCNN ARCHITECTURE ───────────────────────────────────────────────────────
@@ -147,11 +156,9 @@ class CGCNNAtomwise(nn.Module):
         self.distance_expansion = GaussianSmearing(0.0, cutoff, 64)
         self.convs = nn.ModuleList([CGCNNConv(hidden_channels, 64) for _ in range(num_blocks)])
 
-    def forward(self, z, pos, batch):
+    def forward(self, z, edge_index, edge_dist):
         x = self.embedding(z)
-        edge_index = robust_radius_graph(pos, r=self.cutoff, batch=batch)
-        edge_weight = torch.norm(pos[edge_index[0]] - pos[edge_index[1]], p=2, dim=-1)
-        edge_attr = self.distance_expansion(edge_weight)
+        edge_attr = self.distance_expansion(edge_dist)
         for conv in self.convs:
             x = conv(x, edge_index, edge_attr)
         return x
@@ -171,14 +178,17 @@ class SublatticeAttentionPool(nn.Module):
         device = x.device
         
         re_repr = global_mean_pool(self.re_proj(x[is_RE]), batch[is_RE], size=n_graphs) if is_RE.any() else torch.zeros(n_graphs, SUBLAT_DIM, device=device)
-        non_RE = ~is_RE
-        
-        if is_TM.any(): 
-            tm_repr = global_mean_pool(self.tm_proj(x[is_TM]), batch[is_TM], size=n_graphs)
-        elif non_RE.any(): 
-            tm_repr = global_mean_pool(self.all_proj(x[non_RE]), batch[non_RE], size=n_graphs)
-        else: 
-            tm_repr = re_repr.detach().clone()
+
+        # Choose the partner sublattice per crystal, not per batch: TM atoms if the crystal has any,
+        # otherwise its non-RE atoms, otherwise (pure RE) its own RE representation.
+        def _count(mask):
+            return torch.zeros(n_graphs, device=device).index_add_(0, batch, mask.float())
+        graph_has_tm = _count(is_TM) > 0
+        fallback = ~is_RE & ~graph_has_tm[batch]
+        partner = is_TM | fallback
+        h = torch.where(is_TM.unsqueeze(-1), self.tm_proj(x), self.all_proj(x))
+        tm_pooled = global_mean_pool(h[partner], batch[partner], size=n_graphs)
+        tm_repr = torch.where((_count(partner) > 0).unsqueeze(-1), tm_pooled, re_repr.detach())
 
         re_q, tm_k = re_repr.unsqueeze(1), tm_repr.unsqueeze(1)
         attended, _ = self.cross_attn(re_q, tm_k, tm_k)
@@ -195,24 +205,26 @@ class MagGNoME(nn.Module):
         self.sg_embedding = nn.Embedding(232, SG_EMB_DIM)
         self.sublattice_pool = SublatticeAttentionPool()
         self.dropout = nn.Dropout(p=0.15)
-        self.bhmax_head = nn.Sequential(nn.Linear(SUBLAT_DIM, 32), nn.ReLU(), nn.Dropout(0.15), nn.Linear(32, 1), nn.Softplus())
+        self.js_head = nn.Sequential(nn.Linear(SUBLAT_DIM, 32), nn.ReLU(), nn.Dropout(0.15), nn.Linear(32, 1), nn.Softplus())
         self.site_moment_head = nn.Sequential(nn.Linear(CGCNN_HIDDEN, 32), nn.ReLU(), nn.Linear(32, 1))
 
     def forward(self, data, mc_dropout=False, return_dominance=False):
-        atom_repr = self.dropout(self.cgcnn(data.z, data.pos, data.batch)) if mc_dropout else self.cgcnn(data.z, data.pos, data.batch)
+        atom_repr = self.cgcnn(data.z, data.edge_index, data.edge_dist)
+        if mc_dropout: atom_repr = self.dropout(atom_repr)
         sg_emb = self.sg_embedding(data.sg.squeeze(-1))
         n_graphs = data.batch.max().item() + 1
         if sg_emb.dim() == 1: sg_emb = sg_emb.unsqueeze(0)
 
         crystal_repr, re_dominance = self.sublattice_pool(atom_repr, data.batch, data.is_RE, data.is_TM, sg_emb, n_graphs)
 
-        bhmax_pred, site_m_pred = self.bhmax_head(crystal_repr), self.site_moment_head(atom_repr)     
-        return (bhmax_pred, site_m_pred, re_dominance) if return_dominance else (bhmax_pred, site_m_pred)
+        js_pred, site_m_pred = self.js_head(crystal_repr), self.site_moment_head(atom_repr)     # js_pred: J_s in T
+        return (js_pred, site_m_pred, re_dominance) if return_dominance else (js_pred, site_m_pred)
 
 class CombinedMagLoss(nn.Module):
-    def forward(self, u_pred, u_true, site_pred, site_true, has_site_labels, batch_idx):
-        base = F.huber_loss(u_pred, u_true, delta=1.0, reduction="none")
-        primary = ((1.0 + 2.0 * (u_true >= MAGNITO_THRESHOLD).float() * (u_pred < u_true).float()) * base).mean()
+    def forward(self, js_pred, bh_true, site_pred, site_true, has_site_labels, batch_idx):
+        js_true = js_from_bhmax(bh_true)
+        base = F.huber_loss(js_pred, js_true, delta=1.0, reduction="none")
+        primary = ((1.0 + 2.0 * (js_true >= JS_THRESHOLD).float() * (js_pred < js_true).float()) * base).mean()
         
         atom_has_label = has_site_labels.squeeze(-1)[batch_idx] 
         if not atom_has_label.any() or AUX_WEIGHT == 0.0: return primary
@@ -244,7 +256,9 @@ def _build_and_cache_one(struct, total_moment, site_moments, mat_id, cache_dir):
     moment_known = total_moment is not None
     y = torch.tensor([[bhmax_from_moment(float(total_moment))]], dtype=torch.float) if moment_known and not np.isnan(float(total_moment)) else None
 
-    data = Data(z=z, pos=pos, sg=torch.tensor([get_spacegroup_number(struct)], dtype=torch.long), 
+    edge_index, edge_dist = periodic_radius_graph(struct, CUTOFF_RADIUS)
+
+    data = Data(z=z, pos=pos, edge_index=edge_index, edge_dist=edge_dist, num_nodes=n_atoms, sg=torch.tensor([get_spacegroup_number(struct)], dtype=torch.long), 
                 global_feats=torch.tensor([math.log1p(abs(float(total_moment))) if moment_known else 0.0], dtype=torch.float), 
                 global_feats_known=torch.tensor([moment_known], dtype=torch.bool), y=y, 
                 site_m=torch.tensor(m_sites, dtype=torch.float), site_m_norm=torch.tensor(m_sites / max_abs, dtype=torch.float), 
@@ -318,8 +332,8 @@ def evaluate(model, loader):
     with torch.no_grad():
         for batch in loader:
             batch = batch.to(DEVICE)
-            bhmax_pred, _ = model(batch)
-            preds.extend(bhmax_pred.cpu().numpy().flatten())
+            js_pred, _ = model(batch)
+            preds.extend(bhmax_from_js(js_pred).cpu().numpy().flatten())
             targets.extend(batch.y.cpu().numpy().flatten())
             for d in batch.to_data_list(): ids.append(getattr(d, "mat_id", ""))
     
@@ -339,8 +353,8 @@ def training_loop(model, train_loader, val_loader, optimizer, criterion, schedul
         optimizer.zero_grad()
         for batch in train_loader:
             batch = batch.to(DEVICE)
-            bhmax_pred, site_pred = model(batch)
-            loss = criterion(bhmax_pred, batch.y, site_pred.squeeze(-1), batch.site_m_norm, batch.has_site_labels, batch.batch)
+            js_pred, site_pred = model(batch)
+            loss = criterion(js_pred, batch.y, site_pred.squeeze(-1), batch.site_m_norm, batch.has_site_labels, batch.batch)
             loss.backward()
             total_loss += loss.item()
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
@@ -383,7 +397,7 @@ def screen_gnome_materials(model, gnome_cache_dir):
             mc_u, mc_dom = [], []
             for _ in range(MC_PASSES):
                 u_p, _, dom = model(batch, mc_dropout=True, return_dominance=True)
-                mc_u.append(u_p.squeeze(-1))
+                mc_u.append(bhmax_from_js(u_p.squeeze(-1)))   # spread reported in (BH)max units
                 mc_dom.append(dom)
 
             mc_u = torch.stack(mc_u, dim=0).cpu().numpy()
